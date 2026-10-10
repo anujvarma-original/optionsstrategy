@@ -1,0 +1,5 @@
+streamlit==1.65.0
+yfinance==1.7.0
+pandas==2.2.3
+plotly==6.9.0
+tzdata>=2025.1
