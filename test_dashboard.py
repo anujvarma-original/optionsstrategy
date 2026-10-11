@@ -13,6 +13,7 @@ APP = str(Path(__file__).with_name('app.py'))
 
 app = AppTest.from_file(APP).run(timeout=20)
 assert not app.exception, app.exception
+app.text_area[0].set_value('NVDA, AMD, MSFT, AAPL')
 app.checkbox[0].set_value(True)
 app.button[0].click().run(timeout=30)
 assert not app.exception, app.exception
@@ -21,7 +22,7 @@ assert len(bundle['rows']) == 4
 returns = [r['ranking_return_pct'] for r in bundle['rows']]
 assert returns == sorted(returns, reverse=True)
 assert app.warning and 'DEMO' in app.warning[0].value
-assert len(app.get('plotly_chart')) == 1
+assert len(app.get('vega_lite_chart')) == 1
 next(w for w in app.selectbox if w.label == 'Inspect ticker').select('NVDA').run(timeout=20)
 assert not app.exception, app.exception
 assert app.session_state['scan']['rows'] == bundle['rows']
@@ -65,13 +66,42 @@ assert app.error
 assert app.session_state['scan']['rows'] == covered['rows']
 
 # Provider failure renders a useful empty/error state, not an exception.
-with patch('options_scanner.fetch', side_effect=RuntimeError('Too Many Requests: rate limited')) as mocked:
+with patch('market_data.fetch_snapshot', side_effect=RuntimeError('Too Many Requests: rate limited')) as mocked:
     failed = AppTest.from_file(APP).run(timeout=20)
+    assert mocked.call_count == 0, 'Startup must not fetch market data'
     failed.text_area[0].set_value('FAILONE, FAILTWO')
     failed.button[0].click().run(timeout=20)
     assert not failed.exception, failed.exception
     assert len(failed.session_state['scan']['errors']) == 2
     assert not failed.session_state['scan']['rows']
-    assert mocked.call_count == 1
+    assert 1 <= mocked.call_count <= 2
     assert failed.error
-print('PASS: both strategies, coverage, payoff caps, fees, ranking, detail selection, validation, rate-limit handling')
+from market_data import fetch_snapshot
+import subprocess
+with patch('market_data.subprocess.run', side_effect=subprocess.TimeoutExpired('worker',12)) as request:
+    try:
+        fetch_snapshot('NVDA',14,4,'2026-10-11')
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError('Timeout was not surfaced')
+    assert request.call_args.kwargs['timeout'] == 12
+
+# Two live requests overlap; cached snapshots eliminate another fetch on a rescan.
+import threading
+barrier = threading.Barrier(2)
+def mock_snapshot(symbol, days, tolerance, today_iso):
+    barrier.wait(timeout=5)
+    args = SimpleNamespace(strategy='call_overlay', days=days)
+    return synthetic_strategy(symbol,date.fromisoformat(today_iso),args,spot=100,first_bid=3)
+with patch('market_data.fetch_snapshot', side_effect=mock_snapshot) as request:
+    parallel = AppTest.from_file(APP).run(timeout=20)
+    parallel.text_area[0].set_value('PARONE, PARTWO')
+    parallel.button[0].click().run(timeout=20)
+    assert not parallel.exception, parallel.exception
+    assert len(parallel.session_state['scan']['rows']) == 2
+    assert request.call_count == 2
+    parallel.button[0].click().run(timeout=20)
+    assert not parallel.exception
+    assert request.call_count == 2, 'Rescan should reuse cached snapshots'
+print('PASS: both strategies, startup without requests, concurrency, cache reuse, timeout, rate-limit handling')

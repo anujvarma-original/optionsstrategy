@@ -15,7 +15,7 @@ positions; selecting one does not add two calls to the original overlay.
 ## Deploy on Streamlit Community Cloud
 
 1. Extract this package and upload its contents to a GitHub repository. Keep
-   `app.py`, `strategies.py`, `options_scanner.py`, and `requirements.txt` together at the repository root.
+   `app.py`, `market_data.py`, `strategies.py`, `options_scanner.py`, and `requirements.txt` together at the repository root.
    Include `.streamlit/config.toml` for the theme.
 2. Open https://share.streamlit.io and choose **Create app**.
 3. Select your GitHub repository, branch, and entrypoint **app.py**.
@@ -54,7 +54,14 @@ quotes are substituted silently when live data fails.
 - Successful market data cached for 10 minutes; rerunning chart selections
   does not refetch quotes. Displayed scan settings remain tied to that scan.
 - Invalid quotes and unusable contracts appear under skipped tickers.
-- Scan stops requesting more symbols after a Yahoo rate-limit response.
+- Two ticker requests run concurrently. Each request is isolated in a process
+  with a 12-second hard timeout, including provider startup. A scan stops
+  scheduling work after 30 seconds or a rate-limit response. Partial results
+  remain available; unfinished tickers are listed as skipped. An in-flight
+  request may finish in the background within its own timeout.
+- The dashboard shows elapsed scan time. Initial loading makes no Yahoo requests
+  and does not import yfinance. DataFrame import is deferred until results exist.
+- Download reports are cached instead of recreated on each ticker selection.
 
 ## Original overlay calculation
 
@@ -111,6 +118,7 @@ financing, stock commissions, or closing/assignment fees are included.
 
 ```bash
 python options_scanner.py --self-test
+python test_engine.py
 python test_dashboard.py
 ```
 
@@ -119,3 +127,25 @@ CSV/report rendering, and validation using Streamlit AppTest and mocked data. Li
 retrieval in the original environment returned a rate-limit response; the live
 data route has not been verified end to end. Test in your own environment before
 relying on results.
+
+## Deployment dependency fix
+
+The payoff chart now uses Streamlit's built-in line chart; Plotly is no longer
+required or imported. To update an existing deployment, replace app.py and
+requirements.txt with these versions, commit to the branch used by Streamlit,
+and reboot the app through Manage app. Keep requirements.txt next to app.py.
+The remaining dependencies are Streamlit, yfinance, pandas, and tzdata.
+
+## Slow startup vs slow scan
+
+Update all Python files in this package, including the new market_data.py.
+Yahoo fetching now has explicit time limits and two-request concurrency.
+The initial dashboard never fetches data. Streamlit Community Cloud can still
+take time to wake a sleeping app or install dependencies; code changes do not
+eliminate that hosting delay. If the page stalls before the sidebar appears,
+check Manage app logs for dependency installation or startup errors.
+If it stalls after Scan tickers, the scan now reports its progress and stops
+instead of waiting indefinitely. Start with NVDA and AMD, then add tickers.
+
+The standalone options_scanner.py CLI retains its original direct data route;
+the bounded fetch and scan scheduler apply to the Streamlit dashboard.

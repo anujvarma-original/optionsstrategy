@@ -7,12 +7,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import time
 
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-from options_scanner import fetch
+from market_data import fetch_snapshot
 from strategies import STRATEGIES, analyze_strategy, strategy_payoff, save_strategy_report, synthetic_strategy
 
 st.set_page_config(page_title="Bullish Options Scanner", page_icon="📈", layout="wide")
@@ -20,8 +20,7 @@ st.set_page_config(page_title="Bullish Options Scanner", page_icon="📈", layou
 
 @st.cache_data(ttl=600, max_entries=250, show_spinner=False)
 def cached_snapshot(symbol, days, tolerance, today_iso):
-    args = SimpleNamespace(days=days, expiry_tolerance=tolerance)
-    return fetch(symbol, args, date.fromisoformat(today_iso))
+    return fetch_snapshot(symbol, days, tolerance, today_iso)
 
 
 def parse_symbols(text):
@@ -29,6 +28,7 @@ def parse_symbols(text):
     return list(dict.fromkeys(s.upper() for s in re.split(r'[\s,;]+', clean.strip()) if s))
 
 
+@st.cache_data(ttl=600, max_entries=20, show_spinner=False)
 def downloadable_report(bundle):
     args = SimpleNamespace(**bundle['settings'])
     with TemporaryDirectory() as folder:
@@ -41,6 +41,7 @@ def downloadable_report(bundle):
 
 
 st.title("Bullish Options Scanner")
+st.caption('Dashboard v3 · bounded scans')
 st.markdown("**Compare a call overlay with two fully covered calls.**")
 st.caption("Same expiration · 100 or 200 shares by strategy · conditional expiration payoffs")
 
@@ -49,7 +50,7 @@ with st.sidebar:
     with st.form('scan_form'):
         strategy_label = st.selectbox('Strategy', [v['label'] for v in STRATEGIES.values()])
         strategy = next(k for k, v in STRATEGIES.items() if v['label'] == strategy_label)
-        raw = st.text_area('Tickers', value='NVDA, AMD, MSFT, AAPL', height=110,
+        raw = st.text_area('Tickers', value='NVDA, AMD', height=110,
                            help='Comma, space, or newline separated. Up to 25 symbols.')
         days = st.number_input('Target days to expiration', min_value=1, max_value=365, value=14)
         rank_move = st.slider('Stock move used for ranking (%)', -50, 100, 15, 1)
@@ -62,6 +63,7 @@ with st.sidebar:
         submitted = st.form_submit_button('Scan tickers', type='primary', width='stretch')
     st.caption('Successful market snapshots are cached for 10 minutes. Scan results stay until you scan again.')
     st.caption('Yahoo can delay or rate-limit quotes. Demo mode never uses market data.')
+    st.caption('Live scans: two tickers at a time, 12-second timeout per ticker, 30-second scan budget.')
 
 if submitted:
     symbols = parse_symbols(raw)
@@ -78,28 +80,63 @@ if submitted:
         today = datetime.now(ZoneInfo('America/New_York')).date()
         rows, scenarios, errors = [], [], []
         bar = st.progress(0, text='Starting scan')
-        for index, symbol in enumerate(symbols):
-            bar.progress(index/len(symbols), text=f'Loading {symbol} ({index+1}/{len(symbols)})')
+        started = time.monotonic()
+        def record(symbol, snapshot):
             try:
-                snapshot = (synthetic_strategy(symbol, today, args, 100+index*25, 2+index*.5)
-                            if demo else cached_snapshot(symbol, args.days, args.expiry_tolerance, today.isoformat()))
                 row, cases = analyze_strategy(symbol, snapshot, args, today)
                 rows.append(row)
                 scenarios.extend(cases)
             except Exception as exc:
-                message = f'{type(exc).__name__}: {exc}'
-                errors.append(dict(ticker=symbol, error=message))
-                if 'rate limit' in message.lower() or 'too many requests' in message.lower() or '429' in message:
-                    for remaining in symbols[index+1:]:
-                        errors.append(dict(ticker=remaining, error='Not requested: Yahoo rate limit; retry later.'))
-                    break
+                errors.append(dict(ticker=symbol, error=f'{type(exc).__name__}: {exc}'))
+        if demo:
+            for index, symbol in enumerate(symbols):
+                record(symbol, synthetic_strategy(symbol, today, args, 100+index*25, 2+index*.5))
+        else:
+            pool = ThreadPoolExecutor(max_workers=2)
+            pending, queue, processed = {}, list(symbols), set()
+            stop_reason = None
+            try:
+                while queue or pending:
+                    remaining = 30-(time.monotonic()-started)
+                    if remaining <= 0:
+                        stop_reason = 'Scan reached its 30-second budget; retry remaining tickers.'
+                        break
+                    while queue and len(pending) < 2:
+                        symbol = queue.pop(0)
+                        future = pool.submit(cached_snapshot, symbol, args.days, args.expiry_tolerance, today.isoformat())
+                        pending[future] = symbol
+                    done, _ = wait(pending, timeout=min(.25, remaining), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        symbol = pending.pop(future)
+                        processed.add(symbol)
+                        try:
+                            record(symbol, future.result())
+                        except Exception as exc:
+                            message = f'{type(exc).__name__}: {exc}'
+                            errors.append(dict(ticker=symbol, error=message))
+                            if 'rate limit' in message.lower() or 'too many requests' in message.lower() or '429' in message:
+                                stop_reason = 'Yahoo rate limited the scan; retry later.'
+                    bar.progress(len(processed)/len(symbols),
+                                 text=f'{len(processed)}/{len(symbols)} finished · {time.monotonic()-started:.0f}s elapsed')
+                    if stop_reason:
+                        break
+            finally:
+                for future in pending:
+                    future.cancel()
+                # In-flight children remain limited to their 12-second timeout.
+                pool.shutdown(wait=False, cancel_futures=True)
+            if stop_reason:
+                for symbol in symbols:
+                    if symbol not in processed:
+                        errors.append(dict(ticker=symbol, error=stop_reason))
         bar.progress(1.0, text='Scan complete')
         key = 'ranking_return_pct' if args.rank_by == 'return' else 'ranking_profit'
         rows.sort(key=lambda r: r[key], reverse=True)
         order = {r['ticker']: i for i, r in enumerate(rows)}
         scenarios.sort(key=lambda s: (order[s['ticker']], s['stock_move_pct']))
         st.session_state['scan'] = dict(rows=rows, scenarios=scenarios, errors=errors,
-                                       settings=settings, scanned_at=datetime.now(ZoneInfo('America/Chicago')).isoformat())
+                                       settings=settings, elapsed_seconds=time.monotonic()-started,
+                                       scanned_at=datetime.now(ZoneInfo('America/Chicago')).isoformat())
 
 if 'scan' not in st.session_state:
     st.info('Enter your ticker list and click Scan tickers. Enable Demo mode to preview the dashboard without market data.')
@@ -108,6 +145,7 @@ The two-call strategy uses 200 shares and sells one call at +15% and one at +30%
 Between those strikes only 100 shares retain upside; above the higher strike profit is capped.
 Both calls are covered. Available strikes round upward; actual percentages appear in each ticker detail.''')
 else:
+    import pandas as pd
     bundle = st.session_state['scan']
     rows, scenarios, errors = bundle['rows'], bundle['scenarios'], bundle['errors']
     settings = bundle['settings']
@@ -117,6 +155,7 @@ else:
     if settings['demo']:
         st.warning('DEMO — all stock prices and premiums below are synthetic. These are not market quotes.')
     st.caption(f"Results from {bundle['scanned_at']} · Target {settings['days']} calendar days · "
+               f"Scan took {bundle['elapsed_seconds']:.1f}s · "
                f"Ranking scenario {settings['rank_move']:+g}% · "
                f"Ranking by {'percentage return' if settings['rank_by'] == 'return' else 'dollar profit'}")
     if errors:
@@ -160,15 +199,17 @@ else:
             x = sorted(set(x+[row['call1_strike'], row['call2_strike']]))
             y = [strategy_payoff(row['stock_price'], p, row['call1_strike'], row['call2_strike'],
                                  row['net_premium_total'], row['entry_fees'], row['strategy']) for p in x]
-            figure = go.Figure()
-            figure.add_trace(go.Scatter(x=x, y=y, name='Stock + calls', line=dict(color='#2563eb', width=3)))
-            figure.add_trace(go.Scatter(x=x, y=[shares*(p-row['stock_price']) for p in x],
-                                       name='Stock alone', line=dict(color='#94a3b8', dash='dot')))
-            figure.add_hline(y=0, line_color='#64748b')
-            figure.add_vrect(x0=row['call1_strike'], x1=row['call2_strike'], fillcolor='#f59e0b', opacity=.10, line_width=0)
-            figure.update_layout(xaxis_title='Stock price at expiration ($)', yaxis_title=f'Profit / loss per {shares} shares ($)',
-                                 template='plotly_white', legend=dict(orientation='h'), margin=dict(t=30))
-            st.plotly_chart(figure, width='stretch')
+            chart = pd.DataFrame({
+                'Stock price at expiration ($)': x,
+                'Stock + calls': y,
+                'Stock alone': [shares*(p-row['stock_price']) for p in x],
+            })
+            st.line_chart(chart, x='Stock price at expiration ($)',
+                          y=['Stock + calls', 'Stock alone'],
+                          x_label='Stock price at expiration ($)',
+                          y_label=f'Profit / loss per {shares} shares ($)',
+                          color=['#2563eb', '#94a3b8'], width='stretch', height=400)
+            st.caption(f"Call strikes: ${row['call1_strike']:.2f} and ${row['call2_strike']:.2f}.")
             cases = pd.DataFrame([s for s in scenarios if s['ticker'] == selected])
             display = cases.drop(columns=['ticker', 'expiration', 'strategy', 'shares'])
             st.dataframe(display, hide_index=True, width='stretch',
